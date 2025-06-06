@@ -1,0 +1,212 @@
+include:
+  - project: "u-lo/devops"
+    file: '.build-new-reg-template.gitlab-ci.yml'
+    ref: main
+  - project: "u-lo/devops"
+    file: '.functions-new-reg.gitlab-ci.yml'
+    ref: main
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+
+stages:
+  - build
+  - test
+  - sonarqube-check
+  - sonarqube-vulnerability-report
+  - deploy
+
+.before_script: &before_script
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - eval $(ssh-agent -s)
+  - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+  - chmod 0600 ~/.ssh/id_rsa
+  - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+
+variables:
+  VERSION: "1.0.0"
+  BUILD: "${CI_PIPELINE_IID}-${CI_COMMIT_SHORT_SHA}"
+  GOPATH: $CI_PROJECT_DIR/.go
+  SSH_HELP_IMG: "registry2.cicd.u-lo.net:7000/u-lo/devops/ssh-help:latest"
+  ULO_WINDY_API_IMAGE_TAG: "registry2.cicd.u-lo.net:7000/routing/windyapi:${VERSION}.${BUILD}"
+  ULO_WINDY_API_IMAGE_TAG_LATEST: "registry2.cicd.u-lo.net:7000/routing/windyapi:latest"
+  REMOTE_TEMPORARY_PATH: "/home/ulouser/.gitlab/${CI_JOB_ID}"
+  ULO_WINDY_API_DOCKERFILE: $CI_PROJECT_DIR/.devops/Dockerfile
+  END_CATALOG: "opt"
+  ULO_WINDY_API_EXPOSED_PORT: "8003:8003"
+  SSH_PORT: "22"
+  ULO_WINDY_API_TAG:
+    description: Fill the image Tag if you are about to deploy only
+    value: ""
+  BUILD_APP:
+    description: Defines whether to deploy the ulo windy api app
+    value: "false"
+    options:
+      - "false"
+      - "true"
+  DEPLOY_APP:
+    description: Defines whether to deploy application
+    value: "false"
+    options:
+      - "false"
+      - "true"
+  CODE_SCAN:
+    description: Code scan??
+    value: 'false'
+    options:
+      - 'false'
+      - 'true'
+  ENVIRONMENT:
+    description: The environment should be deployed
+    value: "mapping-box"
+    options:
+      - "mapping-box"
+  DATABASE_TIMEOUT:
+    description: The value used for database timeout 
+    value: "180"
+  PROCESS_MAX_RECORDS_TO_PROCESS:
+    description: The value used for max records to process
+    value: "500"
+  PROCESS_BATCH_COUNT:
+    description: The value used for process batch count 
+    value: "50000"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        _NO_PUSH: --no-push
+        BUILD_APP: "true"
+        DEPLOY_APP: "false"
+        MIGRATION: "false"
+        CODE_SCAN: "true"
+    - if: $ULO_WINDY_API_TAG != ""
+      variables:
+        ULO_WINDY_API_IMAGE_TAG: "registry2.cicd.u-lo.net:7000/routing/windyapi:${ULO_WINDY_API_TAG}"
+        DEPLOY_APP: "true"
+        CODE_SCAN: "false"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+build:
+  stage: build
+  allow_failure: false
+  variables:
+    _IMAGE: "${ULO_WINDY_API_IMAGE_TAG}"
+    _IMAGE_LATEST: "${ULO_WINDY_API_IMAGE_TAG_LATEST}"
+    _WORKDIR: "${CI_PROJECT_DIR}"
+    _DOCKERFILE: "${ULO_WINDY_API_DOCKERFILE}"
+    _BUILD_ARGUMENTS: ""
+    _LABELS: ""
+  rules:
+    - if: $BUILD_APP == "true"
+      when: always
+  extends:
+    - .build_image
+  tags:
+    - GitLab-runner001-docker
+
+semgrep-sast:
+  tags:
+    - GitLab-runner001-docker
+  rules:
+    - if: $CODE_SCAN == 'true'
+      when: always
+      allow_failure: true
+    - when: never
+  variables:
+    SAST_EXCLUDED_PATHS: "**/*_test.go,_**/*"
+
+sonarqube-check:
+  stage: sonarqube-check
+  image: 
+    name: sonarsource/sonar-scanner-cli:11
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  tags:
+    - GitLab-runner001-docker
+  script: 
+    - sonar-scanner -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.token=$SONAR_TOKEN -Dsonar.branch.name=$CI_COMMIT_BRANCH
+  rules:
+    - if: $CODE_SCAN == 'true'
+      when: always
+      allow_failure: true
+    - when: never
+
+sonarqube-vulnerability-report:
+  stage: sonarqube-vulnerability-report
+  script:
+    - apk add --no-cache curl
+    - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=routing_windyapi_47c96848-bf5c-4d62-a3ff-8f00f4e029de&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+  allow_failure: true
+  rules:
+    - if: $CODE_SCAN == 'true'
+      when: always
+  artifacts:
+    expire_in: 1 day
+    reports:
+      sast: gl-sast-sonar-report.json
+  tags:
+    - GitLab-runner001-docker
+
+container_scanning:
+  tags:
+    - GitLab-runner001-docker
+  variables:
+    CS_REGISTRY_USER: ${NEW_REGISTRY_USER}
+    CS_REGISTRY_PASSWORD: ${NEW_REGISTRY_PASSWORD}
+    CS_IMAGE: ${ULO_WINDY_API_IMAGE_TAG}
+
+deploy:
+  stage: deploy
+  environment: $ENVIRONMENT
+  image: $SSH_HELP_IMG
+  rules:
+    - if: $DEPLOY_APP == "true" 
+      when: manual
+    - when: never
+  variables:
+    REMOTE_DEPLOY_BASE_PATH: "/${END_CATALOG}/ulo/app/ulo-windy-api"
+    REMOTE_LOGS_BASE_PATH: "/${END_CATALOG}/ulo/logs/ulo-windy-api"
+    ULO_NETWORK_EXTERNAL: "true"
+    DD_AGENT_HOST: "172.17.0.1" #Docker network's interface address
+    DD_ENV: $ENVIRONMENT
+    DD_SERVICE: "ulo-windy-api"
+    DATABASE_TIMEOUT: $DATABASE_TIMEOUT
+    PROCESS_MAX_RECORDS_TO_PROCESS: $PROCESS_MAX_RECORDS_TO_PROCESS
+    PROCESS_BATCH_COUNT: $PROCESS_BATCH_COUNT
+  tags:
+    - GitLab-runner001-docker
+  before_script:
+    - *before_script
+  script:
+    - !reference [.export_environment_vars, script]
+    - |
+      ssh ulouser@$HOST_NAME -p $SSH_PORT "bash -s" << ENDSSH
+      docker network create --driver=bridge --subnet=172.18.0.0/16 u-lo || $true
+      sudo mkdir -p $REMOTE_DEPLOY_BASE_PATH $REMOTE_LOGS_BASE_PATH
+      mkdir -p $REMOTE_TEMPORARY_PATH
+      ENDSSH
+      export_env DATABASE_TIMEOUT PROCESS_MAX_RECORDS_TO_PROCESS PROCESS_BATCH_COUNT DD_AGENT_HOST DD_ENV DD_SERVICE ULO_WINDY_API_IMAGE_TAG ULO_WINDY_API_EXPOSED_PORT REMOTE_LOGS_BASE_PATH ULO_NETWORK_NAME ULO_NETWORK_EXTERNAL BUILD VERSION >> $ENV_FILE
+      scp -P $SSH_PORT ${CI_PROJECT_DIR}/.devops/docker-compose.tmpl.yaml ulouser@$HOST_NAME:$REMOTE_TEMPORARY_PATH/
+      scp -P $SSH_PORT $ENV_FILE ulouser@$HOST_NAME:$REMOTE_TEMPORARY_PATH/.env
+      ssh ulouser@$HOST_NAME -p $SSH_PORT "bash -s" << ENDSSH
+      sudo cp -r $REMOTE_TEMPORARY_PATH/* $REMOTE_DEPLOY_BASE_PATH
+      sudo cp -r $REMOTE_TEMPORARY_PATH/.env $REMOTE_DEPLOY_BASE_PATH/.env
+      sudo docker compose -p ulo-windy-api-${CI_ENVIRONMENT_NAME} --env-file $REMOTE_DEPLOY_BASE_PATH/.env --file $REMOTE_DEPLOY_BASE_PATH/docker-compose.tmpl.yaml convert  -o $REMOTE_DEPLOY_BASE_PATH/docker-compose.yaml
+      sudo echo -n ${NEW_REGISTRY_PASSWORD} | sudo docker login registry2.cicd.u-lo.net:7000 -u ${NEW_REGISTRY_USER} --password-stdin
+      sudo docker pull ${ULOAPI_IMAGE_TAG}
+      sudo docker compose -f $REMOTE_DEPLOY_BASE_PATH/docker-compose.yaml up -d --wait --force-recreate
+      ENDSSH
+      echo -e "\033[0;96m Run docker prune \033[0m"
+      ssh ulouser@$HOST_NAME -p $SSH_PORT "bash -s" << ENDSSH
+      sudo docker system prune -a -f
+      df -h
+      ENDSSH
+
